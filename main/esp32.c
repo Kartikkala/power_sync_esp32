@@ -2,6 +2,7 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "nvs_flash.h"
@@ -11,13 +12,13 @@
 #include "esp_log.h"
 #include "esp_http_server.h"
 
-// --- THE NEW V6.X PROVISIONING HEADERS ---
-#include "network_provisioning/manager.h"
-#include "network_provisioning/scheme_softap.h"
+// --- THE V5.3 STABLE PROVISIONING HEADERS ---
+#include "wifi_provisioning/manager.h"
+#include "wifi_provisioning/scheme_softap.h"
 
 static const char *TAG = "PowerSync_Node";
 
-#define API_ENDPOINT   "http://192.168.1.5:8999/esp"
+#define API_ENDPOINT   "http://10.143.211.158:8999/esp"
 
 // --- Hardware Pins ---
 #define RELAY_PIN      5
@@ -25,6 +26,10 @@ static const char *TAG = "PowerSync_Node";
 #define RXD_PIN        16 
 #define UART_NUM       UART_NUM_2
 #define MAX_CURRENT_THRESHOLD 5.0
+
+// --- FreeRTOS Event Group ---
+static EventGroupHandle_t wifi_event_group;
+const int WIFI_CONNECTED_BIT = BIT0;
 
 // --- ESP32 API Endpoints ---
 
@@ -48,11 +53,9 @@ static esp_err_t relay_off_handler(httpd_req_t *req) {
 static httpd_handle_t start_webserver(void) {
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    // Default port is 80
 
     ESP_LOGI(TAG, "Starting HTTP Server on port: '%d'", config.server_port);
     if (httpd_start(&server, &config) == ESP_OK) {
-        // Register URI handlers
         httpd_uri_t uri_on = { .uri = "/on", .method = HTTP_GET, .handler = relay_on_handler, .user_ctx = NULL };
         httpd_uri_t uri_off = { .uri = "/off", .method = HTTP_GET, .handler = relay_off_handler, .user_ctx = NULL };
         
@@ -66,31 +69,32 @@ static httpd_handle_t start_webserver(void) {
 
 // --- Event Handlers for Wi-Fi & Provisioning ---
 static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
-    if (event_base == NETWORK_PROV_EVENT) {
+    if (event_base == WIFI_PROV_EVENT) {
         switch (event_id) {
-            case NETWORK_PROV_START:
+            case WIFI_PROV_START:
                 ESP_LOGI(TAG, "Provisioning started. Connect your phone to 'PowerSync-Setup'");
                 break;
-            // FIXED: Using the _WIFI_ specific event flags for v6.x
-            case NETWORK_PROV_WIFI_CRED_RECV:
+            case WIFI_PROV_CRED_RECV:
                 ESP_LOGI(TAG, "Received Wi-Fi credentials from phone!");
                 break;
-            case NETWORK_PROV_WIFI_CRED_SUCCESS:
+            case WIFI_PROV_CRED_SUCCESS:
                 ESP_LOGI(TAG, "Provisioning successful!");
                 break;
-            case NETWORK_PROV_END:
+            case WIFI_PROV_END:
                 ESP_LOGI(TAG, "Provisioning session ended. Manager shutting down.");
-                network_prov_mgr_deinit();
+                wifi_prov_mgr_deinit();
                 break;
         }
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGI(TAG, "Disconnected. Retrying Wi-Fi connection...");
+        xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT); // Flag connection as lost
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "Brilliant! Connected with IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT); // Green light for HTTP POST
         start_webserver();
     }
 }
@@ -103,35 +107,27 @@ void start_wifi_provisioning(void) {
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&cfg);
 
-    // Register event handlers
-    esp_event_handler_register(NETWORK_PROV_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL);
+    esp_event_handler_register(WIFI_PROV_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL);
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL);
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL);
 
-    // Initialize the New Provisioning Manager
-    network_prov_mgr_config_t config = {
-        .scheme = network_prov_scheme_softap,
-        .scheme_event_handler = NETWORK_PROV_EVENT_HANDLER_NONE
+    wifi_prov_mgr_config_t config = {
+        .scheme = wifi_prov_scheme_softap,
+        .scheme_event_handler = WIFI_PROV_EVENT_HANDLER_NONE
     };
-    network_prov_mgr_init(config);
+    wifi_prov_mgr_init(config);
 
     bool provisioned = false;
-    // Check if Wi-Fi credentials already exist in NVS
-    network_prov_mgr_is_wifi_provisioned(&provisioned);
+    wifi_prov_mgr_is_provisioned(&provisioned);
 
     if (!provisioned) {
         ESP_LOGI(TAG, "Starting Wi-Fi Provisioning via SoftAP...");
-        
-	    // This will now compile perfectly and accept a standard string!
-        network_prov_security_t security = NETWORK_PROV_SECURITY_1;       
-        // FIXED: This is the PIN you will type into the Mobile App to authorize the payload
-        const char *pop = "powersync"; 
-        
-        // FIXED: Launch SoftAP with the correct v6.x function name
-        network_prov_mgr_start_provisioning(security, (const void *)pop, "PowerSync-Setup", NULL);
+        wifi_prov_security_t security = WIFI_PROV_SECURITY_1;
+        const char *pop = "powersync";   // Proof-of-possession shown in the app
+        wifi_prov_mgr_start_provisioning(security, pop, "PowerSync-Setup", NULL);
     } else {
         ESP_LOGI(TAG, "Already provisioned, starting Wi-Fi STA normally.");
-        network_prov_mgr_deinit();
+        wifi_prov_mgr_deinit();
         esp_wifi_set_mode(WIFI_MODE_STA);
         esp_wifi_start();
     }
@@ -189,10 +185,19 @@ void telemetry_task(void *pvParameters) {
             float energy = (((data[13] << 8) | data[14]) | ((data[15] << 8) | data[16]) << 16) / 1000.0;
 
             if (current > MAX_CURRENT_THRESHOLD) {
-                gpio_set_level(RELAY_PIN, 0); // Autocut
+                // FIXED BUG: 1 is OFF (Power Cut). Previously you had 0 (ON).
+                gpio_set_level(RELAY_PIN, 1); 
+                ESP_LOGE(TAG, "MAX CURRENT EXCEEDED. AUTOCUT TRIGGERED.");
             }
 
-            post_telemetry(voltage, current, power, energy);
+            // Check if we are connected to Wi-Fi before sending HTTP POST
+            EventBits_t bits = xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, 0);
+            
+            if (bits & WIFI_CONNECTED_BIT) {
+                post_telemetry(voltage, current, power, energy);
+            } else {
+                ESP_LOGW(TAG, "Wi-Fi not ready. Skipping HTTP POST.");
+            }
         }
         vTaskDelay(5000 / portTICK_PERIOD_MS);
     }
@@ -210,11 +215,13 @@ void app_main(void) {
     esp_netif_init();
     esp_event_loop_create_default();
 
+    // Initialize the EventGroup BEFORE starting Wi-Fi or Provisioning
+    wifi_event_group = xEventGroupCreate();
+
     gpio_reset_pin(RELAY_PIN);
     gpio_set_direction(RELAY_PIN, GPIO_MODE_OUTPUT);
     gpio_set_level(RELAY_PIN, 0); 
 
-    // Start the v6.x Provisioning Logic
     start_wifi_provisioning();
 
     xTaskCreate(telemetry_task, "telemetry_task", 4096, NULL, 5, NULL);
